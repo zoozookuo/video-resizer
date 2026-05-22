@@ -150,24 +150,46 @@ function formatBytes(b){
 }
 
 /* ---------------- ffmpeg (single-thread; no special headers needed) ---------------- */
-const CORE_BASE = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm';
-const FFMPEG_BASE = 'https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd';
+const CORE_BASE = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/esm';
+const FFMPEG_BASE = 'https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd';
 let ffmpeg = null, loadPromise = null;
-function getFFmpeg(){
+
+// Fetch a URL into a same-origin blob URL while reporting download progress.
+async function fetchBlobURLProgress(url, mime, onProgress){
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`下載失敗 ${res.status}: ${url}`);
+  const total = Number(res.headers.get('Content-Length')) || 0;
+  if (!res.body) { // fallback: no streaming
+    const buf = new Uint8Array(await res.arrayBuffer());
+    if (onProgress) onProgress(buf.length, total || buf.length);
+    return URL.createObjectURL(new Blob([buf], { type: mime }));
+  }
+  const reader = res.body.getReader();
+  const chunks = []; let received = 0;
+  for (;;){
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value); received += value.length;
+    if (onProgress) onProgress(received, total);
+  }
+  return URL.createObjectURL(new Blob(chunks, { type: mime }));
+}
+
+function getFFmpeg(onProgress){
   if (ffmpeg) return Promise.resolve(ffmpeg);
   if (loadPromise) return loadPromise;
   loadPromise = (async () => {
     const inst = new FFmpeg();
-    // classWorkerURL: the FFmpeg class spawns its own worker. Loading it
-    // straight from a CDN fails ("cannot be accessed from origin ...") because
-    // browsers block cross-origin (and file:// origin 'null') Worker scripts.
-    // Fetching it into a same-origin blob URL first fixes it on Vercel AND when
-    // the file is opened locally.
-    await inst.load({
-      classWorkerURL: await toBlobURL(`${FFMPEG_BASE}/814.ffmpeg.js`, 'text/javascript'),
-      coreURL: await toBlobURL(`${CORE_BASE}/ffmpeg-core.js`, 'text/javascript'),
-      wasmURL: await toBlobURL(`${CORE_BASE}/ffmpeg-core.wasm`, 'application/wasm'),
-    });
+    // classWorkerURL: the FFmpeg class spawns its own (module) worker, which
+    // dynamically imports the ESM core — so the core MUST be the dist/esm build.
+    // Loading these straight from a CDN fails ("cannot be accessed from origin")
+    // because browsers block cross-origin Worker scripts, so we fetch them into
+    // same-origin blob URLs first.
+    const classWorkerURL = await toBlobURL(`${FFMPEG_BASE}/814.ffmpeg.js`, 'text/javascript');
+    const coreURL = await toBlobURL(`${CORE_BASE}/ffmpeg-core.js`, 'text/javascript');
+    // The wasm is the big (~30MB) file — fetch it with progress feedback.
+    const wasmURL = await fetchBlobURLProgress(`${CORE_BASE}/ffmpeg-core.wasm`, 'application/wasm', onProgress);
+    await inst.load({ classWorkerURL, coreURL, wasmURL });
     ffmpeg = inst;
     return inst;
   })();
@@ -564,9 +586,13 @@ async function start(){
   state.running = true;
   refreshControls();
   $('progressWrap').style.display = ''; $('phaseNote').style.display = 'none';
-  setProgress(0, '載入轉檔引擎 (FFmpeg)…');
+  setProgress(0, '首次載入轉檔引擎（約 30MB，下載後會快取，下次很快）…');
   try {
-    const ff = await getFFmpeg();
+    const ff = await getFFmpeg((received, total) => {
+      const mb = (received / 1048576).toFixed(1);
+      const totStr = total ? ` / ${(total / 1048576).toFixed(0)}MB` : '';
+      setProgress(total ? received / total : 0, `下載轉檔引擎… ${mb}MB${totStr}（只需這一次，之後會快取）`);
+    });
     const totalUnits = state.entries.length;
     let idx = 0;
     for (const entry of state.entries){
