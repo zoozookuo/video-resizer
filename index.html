@@ -150,7 +150,7 @@ function formatBytes(b){
 }
 
 /* ---------------- ffmpeg (single-thread; no special headers needed) ---------------- */
-const CORE_BASE = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd';
+const CORE_BASE = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm';
 const FFMPEG_BASE = 'https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd';
 let ffmpeg = null, loadPromise = null;
 function getFFmpeg(){
