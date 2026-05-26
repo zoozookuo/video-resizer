@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="zh-TW" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>智慧影片批次裁切與轉檔工具 (Pro Dark Edition)</title>
+    <script src="https://cdn.tailwindcss.com/3.4.1"></script>
+    
+    <!-- 引入 FFmpeg 給前端使用 (v0.12 單執行緒版) -->
+    <script src="https://unpkg.com/@ffmpeg/ffmpeg@0.12.6/dist/umd/ffmpeg.js"></script>
+    <script src="https://unpkg.com/@ffmpeg/util@0.12.1/dist/umd/index.js"></script>
+    
+    <!-- 引入 JSZip 用於打包下載 -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+
+    <style>
+        body { 
+            background-color: #0f172a; 
+            color: #f1f5f9; 
+            -webkit-tap-highlight-color: transparent; 
+        }
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #334155; border-radius: 10px; }
+        ::-webkit-scrollbar-thumb:hover { background: #475569; }
+        .spin { animation: spin 1s linear infinite; }
+        @keyframes spin { 100% { transform: rotate(360deg); } }
+        
+        /* 裁切框三分線 Grid (視覺輔助) */
+        .grid-overlay {
+            background-image: 
+                linear-gradient(to right, rgba(255,255,255,0.25) 1px, transparent 1px),
+                linear-gradient(to bottom, rgba(255,255,255,0.25) 1px, transparent 1px);
+            background-size: 33.33% 33.33%;
+            pointer-events: none; /* 讓滑鼠事件穿透到下方的 Canvas */
+        }
+    </style>
+
+    <script>
+        // --- 核心修復：Worker 全域攔截器 ---
+        // 將外部 CDN 的 Worker 腳本轉換為本地 Blob URL，完美解決 CORS 與跨域隔離問題
+        (function patchWorker() {
+            if (window._workerPatched) return;
+            const OriginalWorker = window.Worker;
+            window.Worker = function(url, options) {
+                const urlStr = url instanceof URL ? url.href : url;
+                if (typeof urlStr === 'string' && urlStr.startsWith('http') && urlStr.includes('@ffmpeg')) {
+                    const blobCode = (options && options.type === 'module') 
+                        ? `import '${urlStr}';` : `importScripts('${urlStr}');`;
+                    const blob = new Blob([blobCode], { type: 'application/javascript' });
+                    return new OriginalWorker(URL.createObjectURL(blob), options);
+                }
+                return new OriginalWorker(url, options);
+            };
+            window._workerPatched = true;
+        })();
+    </script>
+</head>
+<body class="min-h-screen font-sans pb-20">
+
+    <!-- 隱藏的元素用於處理影像與 Canvas 截圖 -->
+    <video id="hidden-video" playsinline hidden crossorigin="anonymous"></video>
+    <canvas id="hidden-canvas" hidden></canvas>
+
+    <!-- 主要內容區 -->
+    <div class="max-w-4xl mx-auto p-4 sm:p-8 space-y-8">
+        <header class="text-center pt-8 mb-8">
+            <h1 class="text-3xl font-extrabold text-white flex items-center justify-center gap-3">
+                🎬 Video Processor
+            </h1>
+            <p class="text-slate-400 mt-3 max-w-xl mx-auto">
+                Multiple Mix
+            </p>
+        </header>
+
+        <!-- 引擎載入狀態提示 -->
+        <div id="loading-engine-msg" class="bg-indigo-900/30 border border-indigo-700/50 text-indigo-300 px-4 py-3 rounded-xl flex items-center gap-3 justify-center shadow-sm">
+            <svg class="w-5 h-5 spin" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
+            <span class="font-medium" id="loading-text">正在載入 FFmpeg 影音處理核心，請稍候...</span>
+        </div>
+
+        <!-- 檔案上傳區塊 -->
+        <div class="bg-slate-900 rounded-2xl shadow-sm border border-slate-700 p-6 sm:p-10 transition-all hover:border-indigo-500">
+            <label id="upload-label" class="block w-full border-2 border-dashed border-slate-600 rounded-xl p-8 sm:p-12 text-center transition cursor-pointer hover:bg-slate-800 hover:border-indigo-400">
+                <input type="file" multiple accept="video/mp4,video/quicktime,.mp4,.mov" onchange="handleFileUpload(event)" class="hidden" id="file-input" disabled>
+                <div class="flex flex-col items-center justify-center gap-4">
+                    <div class="w-16 h-16 bg-slate-800 text-indigo-400 rounded-full flex items-center justify-center text-3xl">📁</div>
+                    <div>
+                        <p class="text-lg font-bold text-slate-200">點擊或拖曳上傳影片 (支援多選)</p>
+                        <p class="text-sm text-slate-500 mt-1">接受 MP4, MOV 格式</p>
+                    </div>
+                </div>
+            </label>
+        </div>
+
+        <!-- 檔案清單與進度區塊 -->
+        <div id="file-list-container" class="hidden space-y-4">
+            <div class="flex flex-col sm:flex-row justify-between items-start sm:items-end gap-4 pb-2 border-b border-slate-700">
+                <h2 class="text-xl font-bold text-slate-200">待處理清單 (<span id="file-count">0</span>)</h2>
+                <div class="w-full sm:w-auto flex flex-col sm:items-end gap-1.5">
+                    <button id="process-btn" onclick="processVideos()" class="w-full sm:w-auto px-6 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white font-bold rounded-xl shadow-lg transition-all flex justify-center items-center gap-2 active:scale-95">
+                        ▶ Start
+                    </button>
+                    <span class="text-xs text-slate-400 text-center sm:text-right">全部下載完成後，網頁會自動打包全部檔案</span>
+                </div>
+            </div>
+            <div id="file-list" class="grid gap-4">
+                <!-- 動態生成的檔案卡片會放在這裡 -->
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // --- 核心規格設定 (含大小限制 KB) ---
+        const TARGET_SPECS = [
+            { name: '小尺寸', w: 270, h: 360, maxVidKB: 500, maxImgKB: 60 },
+            { name: '中尺寸', w: 420, h: 560, maxVidKB: 800, maxImgKB: 80 },
+            { name: '大尺寸', w: 960, h: 1280, maxVidKB: 1000, maxImgKB: 100 }
+        ];
+
+        let ffmpegInstance = null;
+        let filesData = []; 
+        let isProcessing = false;
+        let editingFileId = null;
+
+        // --- DOM 元素快取 ---
+        const videoEl = document.getElementById('hidden-video');
+        const canvasEl = document.getElementById('hidden-canvas');
+        const fileInput = document.getElementById('file-input');
+        const uploadLabel = document.getElementById('upload-label');
+        const fileListContainer = document.getElementById('file-list-container');
+        const fileListEl = document.getElementById('file-list');
+        const fileCountEl = document.getElementById('file-count');
+        const processBtn = document.getElementById('process-btn');
+        const loadingMsg = document.getElementById('loading-engine-msg');
+
+        const generateId = () => Math.random().toString(36).substr(2, 9);
+        const formatBytes = (bytes) => (bytes / 1024).toFixed(1) + ' KB';
+
+        // --- 1. 初始化 FFmpeg (使用 toBlobURL 迴避跨網域限制) ---
+        async function initApp() {
+            try {
+                if (!window.FFmpegWASM || !window.FFmpegUtil) {
+                    throw new Error("找不到 FFmpegWASM 模組，請檢查網路連線。");
+                }
+                
+                const { FFmpeg } = window.FFmpegWASM;
+                const { toBlobURL } = window.FFmpegUtil;
+                ffmpegInstance = new FFmpeg();
+                
+                // CDN 來源
+                const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd';
+                
+                // 透過 Blob URL 載入核心與 WASM，是免除 SharedArrayBuffer 的關鍵
+                await ffmpegInstance.load({
+                    coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
+                    wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm')
+                });
+                
+                loadingMsg.style.display = 'none';
+                fileInput.disabled = false;
+            } catch (e) {
+                console.error("FFmpeg Init Error:", e);
+                const msgEl = document.getElementById('loading-text');
+                const svgEl = loadingMsg.querySelector('svg');
+                if (svgEl) svgEl.style.display = 'none';
+                msgEl.innerHTML = "❌ FFmpeg 引擎載入失敗：" + (e.message || "請確認網路連線");
+                loadingMsg.className = "bg-red-900/30 border border-red-700/50 text-red-400 px-4 py-3 rounded-xl flex items-center justify-center";
+            }
+        }
+        window.addEventListener('load', () => {
+            initApp();
+            setupDragAndDrop();
+        });
+
+        // --- 2. 處理檔案上傳 ---
+        window.handleFileUpload = async (e) => {
+            if (isProcessing) return;
+            
+            // 支援點擊選擇 (e.target.files) 與拖曳放入 (e.dataTransfer.files)
+            const fileList = e.dataTransfer ? e.dataTransfer.files : e.target.files;
+            if (!fileList) return;
+
+            const selected = Array.from(fileList).filter(f => f.type.startsWith('video/'));
+            if (selected.length === 0) return;
+
+            for (let file of selected) {
+                const id = generateId();
+                const name = file.name.replace(/\.[^/.]+$/, "");
+                const url = URL.createObjectURL(file);
+                
+                videoEl.src = url;
+                await new Promise(r => { videoEl.onloadedmetadata = r; videoEl.load(); });
+                
+                const vw = videoEl.videoWidth;
+                const vh = videoEl.videoHeight;
+                const duration = Math.max(videoEl.duration, 0.5);
+
+                // 初始置中裁切 (以 3:4 比例為主)
+                let cw, ch, cx, cy;
+                const targetRatio = 3 / 4;
+                const videoRatio = vw / vh;
+
+                if (videoRatio > targetRatio) {
+                    ch = vh; 
+                    cw = Math.round(vh * targetRatio);
+                    cy = 0; 
+                    cx = Math.round((vw - cw) / 2);
+                } else {
+                    cw = vw; 
+                    ch = Math.round(vw / targetRatio);
+                    cx = 0; 
+                    cy = Math.round((vh - ch) / 2);
+                }
+
+                filesData.push({
+                    id, file, name, duration, vw, vh, objectURL: url,
+                    crop: { cx, cy, cw, ch }, status: 'pending', progress: 0, results: null
+                });
+            }
+            
+            if (e.target && e.target.value !== undefined) {
+                e.target.value = '';
+            }
+            renderFiles();
+        };
+
+        // --- 2.5 設定拖曳上傳 (Drag & Drop) ---
+        const setupDragAndDrop = () => {
+            const preventDefaults = (evt) => {
+                evt.preventDefault();
+                evt.stopPropagation();
+            };
+
+            ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+                uploadLabel.addEventListener(eventName, preventDefaults, false);
+            });
+
+            ['dragenter', 'dragover'].forEach(eventName => {
+                uploadLabel.addEventListener(eventName, () => {
+                    if (!isProcessing) uploadLabel.classList.add('bg-slate-800', 'border-indigo-400');
+                }, false);
+            });
+
+            ['dragleave', 'drop'].forEach(eventName => {
+                uploadLabel.addEventListener(eventName, () => {
+                    uploadLabel.classList.remove('bg-slate-800', 'border-indigo-400');
+                }, false);
+            });
+
+            uploadLabel.addEventListener('drop', window.handleFileUpload, false);
+        };
+
+        window.removeFile = (id) => {
+            if (isProcessing) return;
+            
+            // 釋放 object URL
+            const file = filesData.find(f => f.id === id);
+            if (file) URL.revokeObjectURL(file.objectURL);
+            
+            filesData = filesData.filter(f => f.id !== id);
+            renderFiles();
+        };
+
+        // --- 3. 渲染 UI (含 JSZip 打包按鈕) ---
+        function renderFiles() {
+            if (filesData.length > 0) {
+                fileListContainer.classList.remove('hidden');
+                fileCountEl.innerText = filesData.length;
+            } else {
+                fileListContainer.classList.add('hidden');
+            }
+
+            fileListEl.innerHTML = filesData.map(f => {
+                let statusHtml = '';
+                if (f.status === 'pending') {
+                    statusHtml = `
+                        <button onclick="removeFile('${f.id}')" class="p-2 text-slate-500 hover:text-red-400 hover:bg-slate-800 rounded-lg transition font-bold">✕</button>
+                    `;
+                } else if (f.status === 'processing') {
+                    statusHtml = `
+                        <div class="w-full sm:w-48 text-right">
+                            <div class="flex justify-between text-xs font-bold text-indigo-400 mb-1">
+                                <span>優化轉檔中...</span><span>${f.progress}%</span>
+                            </div>
+                            <div class="w-full bg-slate-800 rounded-full h-2 overflow-hidden">
+                                <div class="bg-indigo-500 h-full rounded-full transition-all duration-300" style="width: ${f.progress}%"></div>
+                            </div>
+                        </div>
+                    `;
+                } else if (f.status === 'done') {
+                    statusHtml = `
+                        <span class="px-3 py-1 bg-emerald-900/50 text-emerald-400 border border-emerald-800 rounded-full text-xs font-bold mr-2 inline-flex items-center gap-1">
+                            <svg class="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7"/></svg>
+                            完成
+                        </span>
+                        <button onclick="downloadZip('${f.id}')" class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-bold transition flex items-center gap-1 shadow-md">
+                            📦 打包下載
+                        </button>
+                    `;
+                }
+
+                let resultsHtml = '';
+                if (f.status === 'done' && f.results) {
+                    const cards = f.results.map((res, i) => {
+                        const spec = TARGET_SPECS[i];
+                        return `
+                            <div class="bg-slate-800 border border-slate-700 rounded-xl p-4 shadow-sm relative hover:border-indigo-500/50 transition-colors">
+                                <div class="font-mono font-bold text-slate-200 text-lg mb-1">${res.specName}</div>
+                                <div class="text-xs text-slate-400 mb-4">${spec.name}</div>
+                                <div class="space-y-3">
+                                    <div class="flex items-center justify-between gap-2 p-2 bg-slate-900/50 rounded-lg">
+                                        <div class="min-w-0 flex-1">
+                                            <div class="text-xs font-bold text-slate-400">MP4 (CRF)</div>
+                                            <div class="text-xs font-mono truncate ${res.vidPass ? 'text-emerald-400' : 'text-amber-500'}">
+                                                ${formatBytes(res.vidSize)} / ${spec.maxVidKB}KB
+                                            </div>
+                                        </div>
+                                        <a href="${res.vidUrl}" download="${f.name}_${res.specName}.mp4" class="shrink-0 text-indigo-400 hover:text-indigo-300 text-xs font-bold">下載</a>
+                                    </div>
+                                    <div class="flex items-center justify-between gap-2 p-2 bg-slate-900/50 rounded-lg">
+                                        <div class="min-w-0 flex-1">
+                                            <div class="text-xs font-bold text-slate-400">JPG</div>
+                                            <div class="text-xs font-mono truncate ${res.imgPass ? 'text-emerald-400' : 'text-amber-500'}">
+                                                ${formatBytes(res.imgSize)} / ${spec.maxImgKB}KB
+                                            </div>
+                                        </div>
+                                        <a href="${res.imgUrl}" download="${f.name}_${res.specName}_thumb.jpg" class="shrink-0 text-indigo-400 hover:text-indigo-300 text-xs font-bold">下載</a>
+                                    </div>
+                                </div>
+                            </div>
+                        `;
+                    }).join('');
+                    resultsHtml = `<div class="p-5 border-t border-slate-800 bg-slate-900/50"><div class="grid grid-cols-1 md:grid-cols-3 gap-4">${cards}</div></div>`;
+                }
+
+                return `
+                    <div class="bg-slate-900 rounded-2xl shadow-sm border border-slate-700 overflow-hidden">
+                        <div class="p-4 sm:p-5 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+                            <div class="flex items-center gap-4 w-full sm:w-auto min-w-0">
+                                <div class="w-12 h-12 bg-slate-800 rounded-lg flex items-center justify-center flex-shrink-0 text-xl shadow-inner">🎬</div>
+                                <div class="min-w-0">
+                                    <h3 class="font-bold text-slate-200 truncate" title="${f.name}">${f.name}</h3>
+                                    <p class="text-xs text-slate-500 font-mono">${f.vw}x${f.vh} • ${f.duration.toFixed(1)}秒</p>
+                                </div>
+                            </div>
+                            <div class="flex items-center gap-2 w-full sm:w-auto justify-end">${statusHtml}</div>
+                        </div>
+                        ${resultsHtml}
+                    </div>
+                `;
+            }).join('');
+        }
+
+        // --- 4. JSZip 打包下載 ---
+        window.downloadZip = async (id) => {
+            const f = filesData.find(x => x.id === id);
+            if (!f || !f.results) return;
+            
+            const zip = new JSZip();
+            const folder = zip.folder(f.name);
+            
+            for (const res of f.results) {
+                // 從產生好的 blob URL 抓取檔案資料
+                const vidBlob = await fetch(res.vidUrl).then(r => r.blob());
+                const imgBlob = await fetch(res.imgUrl).then(r => r.blob());
+                folder.file(`${f.name}_${res.specName}.mp4`, vidBlob);
+                folder.file(`${f.name}_${res.specName}_thumb.jpg`, imgBlob);
+            }
+            
+            const content = await zip.generateAsync({type: "blob"});
+            const url = URL.createObjectURL(content);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `${f.name}_Complete.zip`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        };
+
+        // 新增：自動將所有完成的檔案打包下載
+        window.autoDownloadAllZip = async () => {
+            const doneFiles = filesData.filter(f => f.status === 'done' && f.results);
+            if (doneFiles.length === 0) return;
+
+            const zip = new JSZip();
+            
+            for (const f of doneFiles) {
+                // 每個影片建立專屬資料夾
+                const folder = zip.folder(f.name);
+                for (const res of f.results) {
+                    const vidBlob = await fetch(res.vidUrl).then(r => r.blob());
+                    const imgBlob = await fetch(res.imgUrl).then(r => r.blob());
+                    folder.file(`${f.name}_${res.specName}.mp4`, vidBlob);
+                    folder.file(`${f.name}_${res.specName}_thumb.jpg`, imgBlob);
+                }
+            }
+            
+            const content = await zip.generateAsync({type: "blob"});
+            const url = URL.createObjectURL(content);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `All_Processed_Videos.zip`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        };
+
+        // --- 6. 封面圖片壓縮 (Canvas) ---
+        async function compressImage(crop, targetW, targetH, maxKB) {
+            const ctx = canvasEl.getContext('2d');
+            canvasEl.width = targetW; 
+            canvasEl.height = targetH;
+            
+            ctx.drawImage(videoEl, crop.cx, crop.cy, crop.cw, crop.ch, 0, 0, targetW, targetH);
+
+            let quality = 0.9;
+            let blob = await new Promise(r => canvasEl.toBlob(r, 'image/jpeg', quality));
+            
+            while (blob.size > maxKB * 1024 && quality > 0.15) {
+                quality -= 0.05; 
+                blob = await new Promise(r => canvasEl.toBlob(r, 'image/jpeg', quality));
+            }
+            return blob;
+        }
+
+        // --- 7. 核心處理邏輯 (Lanczos + Constrained CRF 迭代) ---
+        async function transcodeWithCRF(f, spec, crfVal) {
+            const outName = `out_${spec.w}x${spec.h}.mp4`;
+            
+            // Constrained CRF 邏輯：限制最大碼率 (Max Bitrate)
+            const audioKbps = 32; 
+            const targetTotalKbps = (spec.maxVidKB * 8) / f.duration; 
+            let maxVideoKbps = Math.floor(targetTotalKbps - audioKbps);
+            if (maxVideoKbps < 15) maxVideoKbps = 15;
+
+            // 執行 FFmpeg 轉檔 (lanczos+accurate_rnd 縮放、tune film 降噪)
+            await ffmpegInstance.exec([
+                '-i', 'input.mp4',
+                '-vf', `crop=${f.crop.cw}:${f.crop.ch}:${f.crop.cx}:${f.crop.cy},scale=${spec.w}:${spec.h}:flags=lanczos+accurate_rnd`,
+                '-c:v', 'libx264',
+                '-crf', crfVal.toString(),
+                '-maxrate', `${maxVideoKbps}k`,
+                '-bufsize', `${maxVideoKbps * 2}k`,
+                '-tune', 'film',
+                '-r', '18', // 控制幀率
+                '-profile:v', 'high',
+                '-preset', 'slow',
+                '-c:a', 'aac',
+                '-b:a', `${audioKbps}k`,
+                '-ac', '1',
+                '-y', outName
+            ]);
+
+            const vidData = await ffmpegInstance.readFile(outName);
+            const vidBlob = new Blob([vidData.buffer], { type: 'video/mp4' });
+            await ffmpegInstance.deleteFile(outName);
+            
+            return vidBlob;
+        }
+
+        window.processVideos = async () => {
+            if (!ffmpegInstance || filesData.length === 0) return;
+            
+            isProcessing = true;
+            processBtn.disabled = true;
+            processBtn.innerHTML = '批次轉檔中...';
+            processBtn.classList.add('opacity-50', 'cursor-not-allowed');
+            
+            const { fetchFile } = window.FFmpegUtil;
+
+            for (let i = 0; i < filesData.length; i++) {
+                const f = filesData[i];
+                if (f.status === 'done') continue;
+
+                f.status = 'processing';
+                f.progress = 0;
+                renderFiles();
+
+                try {
+                    // 準備影片時間軸以便擷取封面
+                    videoEl.src = f.objectURL;
+                    await new Promise((resolve, reject) => {
+                        videoEl.onloadedmetadata = resolve;
+                        videoEl.onerror = reject;
+                        videoEl.load();
+                    });
+                    videoEl.currentTime = Math.min(0.1, f.duration / 2);
+                    await new Promise(r => { videoEl.onseeked = r; });
+
+                    // 將檔案載入 FFmpeg 虛擬系統
+                    await ffmpegInstance.writeFile('input.mp4', await fetchFile(f.file));
+                    const results = [];
+
+                    // 處理進度條事件綁定
+                    let currentSpecIndex = 0;
+                    const progressHandler = ({ progress }) => {
+                        const base = (currentSpecIndex / TARGET_SPECS.length) * 100;
+                        const chunk = (Math.max(0, Math.min(1, progress))) * (100 / TARGET_SPECS.length);
+                        f.progress = Math.round(base + chunk);
+                        renderFiles();
+                    };
+                    ffmpegInstance.on('progress', progressHandler);
+
+                    for (let j = 0; j < TARGET_SPECS.length; j++) {
+                        currentSpecIndex = j;
+                        const spec = TARGET_SPECS[j];
+                        
+                        // 1. 處理封面縮圖
+                        const imgBlob = await compressImage(f.crop, spec.w, spec.h, spec.maxImgKB);
+                        
+                        // 2. CRF 迭代：初始 CRF=23，若超過大小限制，提高 CRF 持續壓縮直到符合限制
+                        let currentCrf = 23;
+                        let vidBlob = await transcodeWithCRF(f, spec, currentCrf);
+                        
+                        // 使用 while 迴圈，若大小超過限制 (容許 2KB 緩衝)，則不斷提高 CRF (降低畫質) 並嚴格限制碼率
+                        let attempts = 0;
+                        const MAX_ATTEMPTS = 5; // 最多重試 5 次，避免無限迴圈
+
+                        while (vidBlob.size > (spec.maxVidKB * 1024) + 2048 && attempts < MAX_ATTEMPTS) {
+                            attempts++;
+                            currentCrf += 4; // 每次調高 CRF (23 -> 27 -> 31 -> 35 -> 39 -> 43)
+                            
+                            // 為了確保一定壓得下來，每次重試時，將計算 Maxrate 的目標大小再縮小 15% (逼迫 FFmpeg 給更低的碼率)
+                            const stricterSpec = { ...spec, maxVidKB: spec.maxVidKB * (1 - (attempts * 0.15)) };
+                            vidBlob = await transcodeWithCRF(f, stricterSpec, currentCrf);
+                        }
+
+                        results.push({
+                            specName: `${spec.w}x${spec.h}`,
+                            vidUrl: URL.createObjectURL(vidBlob),
+                            vidSize: vidBlob.size,
+                            vidPass: vidBlob.size <= (spec.maxVidKB * 1024) + 2048,
+                            imgUrl: URL.createObjectURL(imgBlob),
+                            imgSize: imgBlob.size,
+                            imgPass: imgBlob.size <= (spec.maxImgKB * 1024) + 1024
+                        });
+                    }
+
+                    // 取消綁定，清理虛擬系統的輸入檔
+                    ffmpegInstance.off('progress', progressHandler);
+                    await ffmpegInstance.deleteFile('input.mp4');
+
+                    f.results = results;
+                    f.status = 'done';
+                    renderFiles();
+
+                } catch (error) {
+                    console.error("檔案處理發生錯誤:", error);
+                    f.status = 'pending';
+                    renderFiles();
+                }
+            }
+            
+            // 所有檔案處理完畢後，自動觸發全部打包下載
+            const hasDoneFiles = filesData.some(f => f.status === 'done');
+            if (hasDoneFiles) {
+                processBtn.innerHTML = '正在打包下載...';
+                await window.autoDownloadAllZip();
+            }
+
+            isProcessing = false;
+            processBtn.disabled = false;
+            processBtn.innerHTML = '▶ Start';
+            processBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+        };
+    </script>
+</body>
+</html>
